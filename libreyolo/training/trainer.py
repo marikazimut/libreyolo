@@ -362,6 +362,12 @@ class BaseTrainer(ABC):
 
         self.config.to_yaml(self.save_dir / "train_config.yaml")
 
+        # CSV training log
+        self.csv_path = self.save_dir / "training_log.csv"
+        with open(self.csv_path, "w") as f:
+            f.write("epoch,train_loss,mAP50,mAP50_95,mAP75,precision,recall,"
+                    "mAP_small,mAP_medium,mAP_large,lr,epoch_time_min\n")
+
         # TensorBoard
         try:
             from torch.utils.tensorboard import SummaryWriter
@@ -388,6 +394,7 @@ class BaseTrainer(ABC):
 
         for epoch in range(self.start_epoch, self.config.epochs):
             self.current_epoch = epoch
+            epoch_start = time.time()
 
             if epoch == self.config.epochs - self.config.no_aug_epochs:
                 logger.info(
@@ -399,9 +406,54 @@ class BaseTrainer(ABC):
             self.final_loss = epoch_loss
             self.epoch_losses.append(epoch_loss)
 
-            if (
-                epoch + 1
-            ) % self.config.save_period == 0 or epoch == self.config.epochs - 1:
+            # Update best metrics and patience every epoch that validation ran.
+            # Must happen before _save_checkpoint so is_best is correctly derived there.
+            if val_metrics:
+                best_metric = val_metrics.get("best_metric", val_metrics.get("mAP50_95", 0.0))
+                if best_metric > self.best_mAP50_95:
+                    self.best_mAP50_95 = best_metric
+                    self.best_mAP50 = val_metrics["mAP50"]
+                    self.best_epoch = epoch + 1
+                    self.patience_counter = 0
+                else:
+                    self.patience_counter += 1
+
+            epoch_time_min = (time.time() - epoch_start) / 60
+            epochs_done = epoch - self.start_epoch + 1
+            epochs_left = self.config.epochs - epoch - 1
+            eta_h = (time.time() - start_time) / epochs_done * epochs_left / 3600
+
+            lr = self.optimizer.param_groups[0]["lr"]
+            gpu_mem = ""
+            if torch.cuda.is_available():
+                gpu_mem = f" | GPU: {torch.cuda.memory_reserved() / 1e9:.1f}GB"
+
+            logger.info(
+                f"Epoch {epoch + 1}/{self.config.epochs} — "
+                f"time: {epoch_time_min:.1f}min | ETA: {eta_h:.1f}h{gpu_mem}"
+            )
+
+            if self.tensorboard_writer:
+                self.tensorboard_writer.add_scalar("epoch/time_min", epoch_time_min, epoch)
+                if torch.cuda.is_available():
+                    self.tensorboard_writer.add_scalar(
+                        "system/gpu_mem_gb", torch.cuda.memory_reserved() / 1e9, epoch
+                    )
+
+            # CSV row
+            val_cols = [val_metrics.get(k, 0.0) if val_metrics else ""
+                        for k in ["mAP50", "mAP50_95", "mAP75", "precision", "recall",
+                                  "mAP_small", "mAP_medium", "mAP_large"]]
+            with open(self.csv_path, "a") as f:
+                row = [epoch + 1, f"{epoch_loss:.6f}"] + \
+                      [f"{v:.6f}" if v != "" else "" for v in val_cols] + \
+                      [f"{lr:.8f}", f"{epoch_time_min:.2f}"]
+                f.write(",".join(map(str, row)) + "\n")
+
+            on_period = (epoch + 1) % self.config.save_period == 0
+            on_final = epoch == self.config.epochs - 1
+            is_new_best = val_metrics is not None and self.best_epoch == epoch + 1
+            if on_period or on_final or is_new_best:
                 self._save_checkpoint(epoch, epoch_loss, val_metrics)
 
             if self.patience_counter >= self.config.patience:
@@ -440,12 +492,13 @@ class BaseTrainer(ABC):
             self.train_loader,
             desc=f"Epoch {epoch + 1}/{self.config.epochs}",
             total=len(self.train_loader),
-            disable=not sys.stderr.isatty(),
+            disable=False,
             file=sys.stderr,
         )
 
         total_loss = 0.0
         num_batches = 0
+        component_totals: Dict[str, float] = {}
 
         for batch_idx, batch in enumerate(pbar):
             if len(batch) == 5:
@@ -481,6 +534,8 @@ class BaseTrainer(ABC):
             loss_val = loss.item()
             loss_components = self.get_loss_components(outputs)
             total_loss += loss_val
+            for k, v in loss_components.items():
+                component_totals[k] = component_totals.get(k, 0.0) + v
 
             del outputs, loss
 
@@ -493,6 +548,8 @@ class BaseTrainer(ABC):
             # Progress bar
             postfix = {"loss": f"{loss_val:.4f}", "lr": f"{lr:.6f}"}
             postfix.update({k: f"{v:.4f}" for k, v in loss_components.items()})
+            if torch.cuda.is_available():
+                postfix["mem"] = f"{torch.cuda.memory_reserved() / 1e9:.1f}G"
             pbar.set_postfix(postfix)
 
             # TensorBoard
@@ -507,10 +564,19 @@ class BaseTrainer(ABC):
                     )
 
         avg_loss = total_loss / num_batches
-        logger.info(f"Epoch {epoch + 1} - Average loss: {avg_loss:.4f}")
+        avg_components = {k: v / num_batches for k, v in component_totals.items()}
+
+        comp_str = " | ".join(f"{k}: {v:.4f}" for k, v in avg_components.items())
+        logger.info(
+            "Epoch %d — Train loss: %.4f%s",
+            epoch + 1, avg_loss,
+            f" | {comp_str}" if comp_str else "",
+        )
 
         if self.tensorboard_writer:
             self.tensorboard_writer.add_scalar("epoch/loss", avg_loss, epoch)
+            for k, v in avg_components.items():
+                self.tensorboard_writer.add_scalar(f"epoch/{k}", v, epoch)
 
         # Validation
         val_metrics = None
@@ -520,12 +586,16 @@ class BaseTrainer(ABC):
         ):
             val_metrics = self._validate_epoch(epoch)
             if val_metrics and self.tensorboard_writer:
-                self.tensorboard_writer.add_scalar(
-                    "val/mAP50", val_metrics["mAP50"], epoch
-                )
-                self.tensorboard_writer.add_scalar(
-                    "val/mAP50_95", val_metrics["mAP50_95"], epoch
-                )
+                tb_val_keys = [
+                    "mAP50", "mAP50_95", "mAP75",
+                    "precision", "recall",
+                    "mAP_small", "mAP_medium", "mAP_large",
+                ]
+                for key in tb_val_keys:
+                    if key in val_metrics:
+                        self.tensorboard_writer.add_scalar(
+                            f"val/{key}", val_metrics[key], epoch
+                        )
 
         return avg_loss, val_metrics
 
@@ -579,15 +649,21 @@ class BaseTrainer(ABC):
                 "mAP50_95": best_metric,
                 "best_metric": best_metric,
                 "best_metric_key": best_key,
+                "precision": results.get("metrics/precision", results.get("metrics/precision(B)", 0.0)),
+                "recall": results.get("metrics/recall", results.get("metrics/recall(B)", 0.0)),
+                "mAP75": results.get("metrics/mAP75", results.get("metrics/mAP75(B)", 0.0)),
+                "mAP_small": results.get("metrics/mAP_small", 0.0),
+                "mAP_medium": results.get("metrics/mAP_medium", 0.0),
+                "mAP_large": results.get("metrics/mAP_large", 0.0),
             }
 
-            logger.debug(
-                f"Extracted metrics: mAP50={metrics['mAP50']:.4f}, mAP50_95={metrics['mAP50_95']:.4f}"
-            )
             logger.info(
-                "Validation - mAP50: %.4f, mAP50-95: %.4f",
-                metrics["mAP50"],
-                metrics["mAP50_95"],
+                "Validation Epoch %d - mAP50: %.4f | mAP50-95: %.4f | mAP75: %.4f | "
+                "Precision: %.4f | Recall: %.4f | mAP_S: %.4f | mAP_M: %.4f | mAP_L: %.4f",
+                epoch + 1,
+                metrics["mAP50"], metrics["mAP50_95"], metrics["mAP75"],
+                metrics["precision"], metrics["recall"],
+                metrics["mAP_small"], metrics["mAP_medium"], metrics["mAP_large"],
             )
             return metrics
 
@@ -605,19 +681,9 @@ class BaseTrainer(ABC):
     def _save_checkpoint(
         self, epoch: int, loss: float, val_metrics: Optional[Dict[str, float]] = None
     ):
-        best_metric = (
-            val_metrics.get("best_metric", val_metrics.get("mAP50_95", 0.0))
-            if val_metrics
-            else 0.0
-        )
-        is_best = bool(val_metrics and best_metric > self.best_mAP50_95)
-        if is_best:
-            self.best_mAP50_95 = best_metric
-            self.best_mAP50 = val_metrics["mAP50"]
-            self.best_epoch = epoch + 1
-            self.patience_counter = 0
-        elif val_metrics:
-            self.patience_counter += 1
+        # best_mAP50_95, best_epoch, and patience_counter are already updated in
+        # the main train() loop every epoch validation runs; just derive is_best here.
+        is_best = val_metrics is not None and self.best_epoch == epoch + 1
 
         model_to_save = self.ema_model.ema if self.ema_model else self.model
 

@@ -64,7 +64,7 @@ class TrainConfig:
     name: str = "exp"
     exist_ok: bool = False
     save_period: int = 10
-    eval_interval: int = 10
+    eval_interval: int = 1
 
     # System
     workers: int = 4
