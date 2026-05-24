@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from functools import partial
+import logging
 import re
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -18,7 +19,7 @@ from ...validation.preprocessors import (
     DEIMv2DINOValPreprocessor,
     DEIMv2ValPreprocessor,
 )
-from ..base import BaseModel
+from ..base import BaseModel, _log_weight_load
 from .nn import DINO_SIZES, SIZE_CONFIGS, LibreDEIMv2Model, normalize_size
 from .utils import (
     postprocess,
@@ -26,6 +27,8 @@ from .utils import (
     preprocess_numpy,
     unwrap_deim_checkpoint,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class LibreDEIMv2(BaseModel):
@@ -340,9 +343,16 @@ class LibreDEIMv2(BaseModel):
             cls._strip_ddp_prefix(dict(state_dict)), size
         )
 
-    def _load_state_dict_checked(self, state_dict: dict) -> None:
+    def _load_state_dict_checked(self, state_dict: dict, model_path: str = "") -> None:
         missing, unexpected = self.model.load_state_dict(
             state_dict, strict=self._strict_loading()
+        )
+        _log_weight_load(
+            model_path=model_path or "(dict state_dict)",
+            model=self.model,
+            ckpt_keys=set(state_dict.keys()),
+            missing=list(missing),
+            unexpected=list(unexpected),
         )
         if unexpected:
             preview = sorted(unexpected)[:10]

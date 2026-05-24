@@ -92,6 +92,34 @@ def _wrap_train_with_cfg(train_fn: Callable) -> Callable:
     return wrapper
 
 
+def _log_weight_load(model_path, model, ckpt_keys, missing, unexpected, ckpt_family="", ckpt_nc=None):
+    total_params = sum(p.numel() for p in model.parameters())
+    model_keys = set(model.state_dict().keys())
+    matched = model_keys & ckpt_keys
+    not_loaded = model_keys - ckpt_keys  # in model but not in checkpoint
+
+    logger.info("=" * 60)
+    logger.info("Pretrained weights loaded: %s", model_path)
+    if ckpt_family:
+        logger.info("  Checkpoint family : %s", ckpt_family)
+    if ckpt_nc is not None:
+        logger.info("  Checkpoint classes: %d", ckpt_nc)
+    logger.info("  Total parameters  : %s", f"{total_params:,}")
+    logger.info("  Matched layers    : %d / %d", len(matched), len(model_keys))
+    if missing:
+        logger.warning("  Missing keys (%d) — will be randomly initialized: %s%s",
+                       len(missing), missing[:5], " ..." if len(missing) > 5 else "")
+    if unexpected:
+        logger.warning("  Unexpected keys (%d) — ignored from checkpoint: %s%s",
+                       len(unexpected), unexpected[:5], " ..." if len(unexpected) > 5 else "")
+    if not missing and not unexpected:
+        logger.info("  All layers matched exactly (strict-equivalent load)")
+    elif not_loaded:
+        pct = len(matched) / len(model_keys) * 100
+        logger.info("  %.1f%% of model layers loaded from pretrained weights", pct)
+    logger.info("=" * 60)
+
+
 class BaseModel(ABC):
     """Abstract base class for LibreYOLO model wrappers.
 
@@ -620,7 +648,16 @@ class BaseModel(ABC):
             else:
                 state_dict = self._prepare_state_dict(loaded)
 
-            self.model.load_state_dict(state_dict, strict=self._strict_loading())
+            result = self.model.load_state_dict(state_dict, strict=self._strict_loading())
+            _log_weight_load(
+                model_path=model_path,
+                model=self.model,
+                ckpt_keys=set(state_dict.keys()),
+                missing=list(result.missing_keys),
+                unexpected=list(result.unexpected_keys),
+                ckpt_family=ckpt_family if isinstance(loaded, dict) else "",
+                ckpt_nc=ckpt_nc if isinstance(loaded, dict) else None,
+            )
             self.model.to(self.device).eval()
         except Exception as e:
             raise RuntimeError(

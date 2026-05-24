@@ -1058,6 +1058,25 @@ class BaseTrainer(ABC):
             _dist.broadcast_object_list(container, src=0)
             self.save_dir = Path(container[0])
 
+        # CSV training log (rank 0 only)
+        if is_main_process():
+            self.csv_path = self.save_dir / "training_log.csv"
+            with open(self.csv_path, "w") as f:
+                f.write("epoch,train_loss,mAP50,mAP50_95,mAP75,precision,recall,"
+                        "mAP_small,mAP_medium,mAP_large,lr,epoch_time_min\n")
+        else:
+            self.csv_path = None
+
+        # TensorBoard (rank 0 only)
+        self.tensorboard_writer = None
+        if is_main_process():
+            try:
+                from torch.utils.tensorboard import SummaryWriter
+                self.tensorboard_writer = SummaryWriter(log_dir=str(self.save_dir / "tensorboard"))
+                logger.info("TensorBoard logging enabled: %s", self.save_dir / "tensorboard")
+            except ImportError:
+                logger.info("TensorBoard not available; skipping TB logging")
+
         # Wait for rank 0 to finish dir creation before any rank proceeds.
         barrier()
         self._is_setup = True
@@ -1130,6 +1149,7 @@ class BaseTrainer(ABC):
 
             for epoch in range(self.start_epoch, self.config.epochs):
                 self.current_epoch = epoch
+                epoch_start = time.time()
 
                 if epoch == no_aug_start:
                     if is_main_process():
@@ -1175,6 +1195,40 @@ class BaseTrainer(ABC):
                 if is_main_process():
                     self._dispatch_artifact_callbacks("on_train_epoch_end", event)
                     self.callbacks.on_train_epoch_end(event)
+
+                # Per-epoch ETA, TensorBoard, and CSV logging (rank 0 only)
+                if is_main_process():
+                    epoch_time_min = (time.time() - epoch_start) / 60
+                    epochs_done = epoch - self.start_epoch + 1
+                    epochs_left = self.config.epochs - epoch - 1
+                    eta_h = (time.time() - start_time) / epochs_done * epochs_left / 3600
+
+                    current_lr = self.optimizer.param_groups[0]["lr"]
+                    gpu_mem = ""
+                    if torch.cuda.is_available():
+                        gpu_mem = f" | GPU: {torch.cuda.memory_reserved() / 1e9:.1f}GB"
+
+                    logger.info(
+                        f"Epoch {epoch + 1}/{self.config.epochs} — "
+                        f"time: {epoch_time_min:.1f}min | ETA: {eta_h:.1f}h{gpu_mem}"
+                    )
+
+                    if self.tensorboard_writer:
+                        self.tensorboard_writer.add_scalar("epoch/time_min", epoch_time_min, epoch)
+                        if torch.cuda.is_available():
+                            self.tensorboard_writer.add_scalar(
+                                "system/gpu_mem_gb", torch.cuda.memory_reserved() / 1e9, epoch
+                            )
+
+                    if self.csv_path is not None:
+                        val_cols = [val_metrics.get(k, 0.0) if val_metrics else ""
+                                    for k in ["mAP50", "mAP50_95", "mAP75", "precision", "recall",
+                                              "mAP_small", "mAP_medium", "mAP_large"]]
+                        with open(self.csv_path, "a") as f:
+                            row = [epoch + 1, f"{epoch_loss:.6f}"] + \
+                                  [f"{v:.6f}" if v != "" else "" for v in val_cols] + \
+                                  [f"{current_lr:.8f}", f"{epoch_time_min:.2f}"]
+                            f.write(",".join(map(str, row)) + "\n")
 
                 # Early-stop decision lives on rank 0 only (patience_counter
                 # is updated from val_metrics, which only rank 0 receives).
@@ -1543,13 +1597,13 @@ class BaseTrainer(ABC):
             self.train_loader,
             desc=f"Epoch {epoch + 1}/{self.config.epochs}",
             total=len(self.train_loader),
-            disable=not sys.stderr.isatty() or not is_main_process(),
+            disable=False,
             file=sys.stderr,
         )
 
         total_loss = 0.0
         num_batches = 0
-        loss_component_sums: Dict[str, float] = {}
+        component_totals: Dict[str, float] = {}
 
         for batch_idx, batch in enumerate(pbar):
             if len(batch) == 5:
@@ -1603,8 +1657,8 @@ class BaseTrainer(ABC):
             loss_val = float(total_loss_raw.item())
             loss_components = self._scalar_mapping(self.get_loss_components(outputs))
             total_loss += loss_val
-            for name, value in loss_components.items():
-                loss_component_sums[name] = loss_component_sums.get(name, 0.0) + value
+            for k, v in loss_components.items():
+                component_totals[k] = component_totals.get(k, 0.0) + v
 
             del outputs, loss
 
@@ -1616,22 +1670,55 @@ class BaseTrainer(ABC):
             # Progress bar
             postfix = {"loss": f"{loss_val:.4f}", "lr": f"{lr:.6f}"}
             postfix.update({k: f"{v:.4f}" for k, v in loss_components.items()})
+            if torch.cuda.is_available():
+                postfix["mem"] = f"{torch.cuda.memory_reserved() / 1e9:.1f}G"
             pbar.set_postfix(postfix)
 
+            # TensorBoard per-batch logging
+            if self.tensorboard_writer and batch_idx % self.config.log_interval == 0:
+                self.tensorboard_writer.add_scalar(
+                    "train/loss", loss_val, self.current_iter
+                )
+                self.tensorboard_writer.add_scalar("train/lr", lr, self.current_iter)
+                for name, val in loss_components.items():
+                    self.tensorboard_writer.add_scalar(
+                        f"train/{name}", val, self.current_iter
+                    )
+
         avg_loss = total_loss / max(num_batches, 1)
-        avg_loss_components = {
-            name: value / max(num_batches, 1)
-            for name, value in loss_component_sums.items()
-        }
+        avg_components = {k: v / max(num_batches, 1) for k, v in component_totals.items()}
+
+        comp_str = " | ".join(f"{k}: {v:.4f}" for k, v in avg_components.items())
         if is_main_process():
-            logger.info(f"Epoch {epoch + 1} - Average loss: {avg_loss:.4f}")
+            logger.info(
+                "Epoch %d — Train loss: %.4f%s",
+                epoch + 1, avg_loss,
+                f" | {comp_str}" if comp_str else "",
+            )
+
+        if self.tensorboard_writer:
+            self.tensorboard_writer.add_scalar("epoch/loss", avg_loss, epoch)
+            for k, v in avg_components.items():
+                self.tensorboard_writer.add_scalar(f"epoch/{k}", v, epoch)
 
         # Validation
         val_metrics = None
         if self._should_validate_epoch(epoch):
             val_metrics = self._validate_epoch(epoch)
 
-        return avg_loss, val_metrics, avg_loss_components, self._current_lrs()
+        if val_metrics and self.tensorboard_writer:
+            tb_val_keys = [
+                "mAP50", "mAP50_95", "mAP75",
+                "precision", "recall",
+                "mAP_small", "mAP_medium", "mAP_large",
+            ]
+            for key in tb_val_keys:
+                if key in val_metrics:
+                    self.tensorboard_writer.add_scalar(
+                        f"val/{key}", val_metrics[key], epoch
+                    )
+
+        return avg_loss, val_metrics, avg_components, self._current_lrs()
 
     def _train_epoch_accum(
         self, epoch: int
@@ -1888,15 +1975,21 @@ class BaseTrainer(ABC):
                 "best_metric": best_metric,
                 "best_metric_key": best_key,
                 "metrics": raw_metrics,
+                "precision": results.get("metrics/precision", results.get("metrics/precision(B)", 0.0)),
+                "recall": results.get("metrics/recall", results.get("metrics/recall(B)", 0.0)),
+                "mAP75": results.get("metrics/mAP75", results.get("metrics/mAP75(B)", 0.0)),
+                "mAP_small": results.get("metrics/mAP_small", 0.0),
+                "mAP_medium": results.get("metrics/mAP_medium", 0.0),
+                "mAP_large": results.get("metrics/mAP_large", 0.0),
             }
 
-            logger.debug(
-                f"Extracted metrics: mAP50={metrics['mAP50']:.4f}, mAP50_95={metrics['mAP50_95']:.4f}"
-            )
             logger.info(
-                "Validation - mAP50: %.4f, mAP50-95: %.4f",
-                metrics["mAP50"],
-                metrics["mAP50_95"],
+                "Validation Epoch %d - mAP50: %.4f | mAP50-95: %.4f | mAP75: %.4f | "
+                "Precision: %.4f | Recall: %.4f | mAP_S: %.4f | mAP_M: %.4f | mAP_L: %.4f",
+                epoch + 1,
+                metrics["mAP50"], metrics["mAP50_95"], metrics["mAP75"],
+                metrics["precision"], metrics["recall"],
+                metrics["mAP_small"], metrics["mAP_medium"], metrics["mAP_large"],
             )
             return metrics
 
