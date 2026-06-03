@@ -10,12 +10,23 @@ import torch
 
 
 def _supports_weights_only() -> bool:
-    """Return whether the installed torch.load supports ``weights_only``."""
-    try:
-        signature = inspect.signature(torch.load)
-    except (TypeError, ValueError):
-        return False
-    return "weights_only" in signature.parameters
+    """Return whether the installed torch.load supports ``weights_only``.
+
+    ``torch.load`` may be monkey-patched at runtime (e.g. ultralytics
+    replaces it with a ``(*args, **kwargs)`` wrapper that forwards kwargs),
+    so fall back to the unpatched ``torch.serialization.load`` signature
+    when ``weights_only`` is not visible on ``torch.load`` itself.
+    """
+    for candidate in (torch.load, getattr(torch.serialization, "load", None)):
+        if candidate is None:
+            continue
+        try:
+            signature = inspect.signature(candidate)
+        except (TypeError, ValueError):
+            continue
+        if "weights_only" in signature.parameters:
+            return True
+    return False
 
 
 def _torch_load(
